@@ -18,7 +18,9 @@ const icons = {
   refresh:
     '<svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   plus:
-    '<svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    '<svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  leave:
+    '<svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 17l5-5-5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 12H3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M21 3v18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
 };
 
 let socket;
@@ -29,6 +31,7 @@ let selectedTileId = null;
 let sortMode = "color";
 let notice = null;
 let noticeTimer = null;
+let intentionallyLeft = false;
 const pendingMessages = [];
 
 const savedSession = readSession();
@@ -40,6 +43,9 @@ document.addEventListener("submit", (event) => {
   const joinForm = event.target.closest("#join-form");
   if (joinForm) {
     event.preventDefault();
+
+    intentionallyLeft = false;
+
     const form = new FormData(joinForm);
     const name = String(form.get("name") || "").trim();
     const roomCode = String(form.get("roomCode") || "").trim();
@@ -55,24 +61,34 @@ document.addEventListener("submit", (event) => {
       roomCode,
       playerId: savedSession.playerId || ""
     });
+
     return;
   }
 
   const scoreForm = event.target.closest("#score-form");
   if (scoreForm) {
     event.preventDefault();
+
     const form = new FormData(scoreForm);
+
     send({
       type: "action",
       action: "adjustScore",
       playerId: String(form.get("playerId") || ""),
       delta: Number(form.get("delta") || 0)
     });
+
     scoreForm.reset();
   }
 });
 
 document.addEventListener("click", (event) => {
+  const leaveButton = event.target.closest("[data-leave-room]");
+  if (leaveButton) {
+    leaveRoom();
+    return;
+  }
+
   const tileButton = event.target.closest("[data-tile-id]");
   if (tileButton && tileButton.matches("button")) {
     const id = tileButton.getAttribute("data-tile-id");
@@ -92,6 +108,7 @@ document.addEventListener("click", (event) => {
   if (copyButton) {
     const code = latestState?.you?.roomCode || "";
     if (!code) return;
+
     navigator.clipboard?.writeText(code);
     showNotice(`Oda kodu kopyalandı: ${code}`);
     return;
@@ -101,12 +118,19 @@ document.addEventListener("click", (event) => {
   if (!actionButton || actionButton.disabled) return;
 
   const action = actionButton.getAttribute("data-action");
+
   if (action === "discard" || action === "finish") {
     if (!selectedTileId) {
       showNotice("Önce bir taş seç.", "error");
       return;
     }
-    send({ type: "action", action, tileId: selectedTileId });
+
+    send({
+      type: "action",
+      action,
+      tileId: selectedTileId
+    });
+
     selectedTileId = null;
     return;
   }
@@ -120,7 +144,14 @@ function connect() {
 
   socket.addEventListener("open", () => {
     connected = true;
-    if (!pendingMessages.length && savedSession.name && savedSession.roomCode && savedSession.playerId) {
+
+    if (
+      !intentionallyLeft &&
+      !pendingMessages.length &&
+      savedSession.name &&
+      savedSession.roomCode &&
+      savedSession.playerId
+    ) {
       socket.send(JSON.stringify({
         type: "join",
         name: savedSession.name,
@@ -128,6 +159,7 @@ function connect() {
         playerId: savedSession.playerId
       }));
     }
+
     flushPendingMessages();
     render();
   });
@@ -137,12 +169,15 @@ function connect() {
 
     if (payload.type === "state") {
       latestState = payload;
+
       const me = payload.players.find((player) => player.id === payload.you.playerId);
+
       writeSession({
         playerId: payload.you.playerId,
         roomCode: payload.you.roomCode,
         name: me?.name || savedSession.name || ""
       });
+
       keepSelectedTileIfPresent(payload.hand);
       render();
       return;
@@ -156,8 +191,12 @@ function connect() {
   socket.addEventListener("close", () => {
     connected = false;
     render();
+
     clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, 1300);
+
+    if (!intentionallyLeft) {
+      reconnectTimer = setTimeout(connect, 1300);
+    }
   });
 
   socket.addEventListener("error", () => {
@@ -176,14 +215,45 @@ function send(payload) {
     showNotice("Sunucu bağlantısı bekleniyor.", "error");
     return;
   }
+
   socket.send(JSON.stringify(payload));
 }
 
 function flushPendingMessages() {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
   while (pendingMessages.length) {
     socket.send(JSON.stringify(pendingMessages.shift()));
   }
+}
+
+function leaveRoom() {
+  if (!latestState) return;
+
+  const ok = confirm("Masadan ayrılmak istiyor musun?");
+  if (!ok) return;
+
+  intentionallyLeft = true;
+  pendingMessages.length = 0;
+
+  try {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "leave" }));
+      socket.close();
+    }
+  } catch {}
+
+  clearTimeout(reconnectTimer);
+
+  latestState = null;
+  selectedTileId = null;
+
+  delete savedSession.roomCode;
+  delete savedSession.playerId;
+  localStorage.setItem("okeySession", JSON.stringify(savedSession));
+
+  showNotice("Masadan ayrıldın.");
+  renderJoin();
 }
 
 function render() {
@@ -206,23 +276,28 @@ function renderJoin() {
             <span>4 kişilik online masa</span>
           </div>
         </div>
+
         <p>İsmini yaz, oda kodu gir veya boş bırakarak yeni masa aç.</p>
+
         <form id="join-form">
           <div class="field-grid">
             <div class="field">
               <label for="name">Oyuncu adı</label>
               <input id="name" name="name" maxlength="24" autocomplete="name" value="${escapeHtml(savedSession.name || "")}" required />
             </div>
+
             <div class="field">
               <label for="roomCode">Oda kodu</label>
               <input id="roomCode" name="roomCode" maxlength="8" autocomplete="off" value="${escapeHtml(savedSession.roomCode || "")}" />
             </div>
           </div>
+
           <div class="join-actions">
             <button class="primary-button" type="submit">${icons.logIn} Odaya Katıl</button>
           </div>
         </form>
       </section>
+
       ${noticeHtml()}
     </main>
   `;
@@ -249,10 +324,12 @@ function renderGame(data) {
             <span>${escapeHtml(me?.name || "Oyuncu")} · El ${data.game.handNumber || 0}</span>
           </div>
         </div>
+
         <div class="room-tools">
           <span class="connection ${connected ? "online" : "offline"}">${connected ? "Bağlı" : "Bağlantı yok"}</span>
           <span class="room-code">Oda ${escapeHtml(data.you.roomCode)}</span>
           <button class="icon-button" type="button" data-copy-room title="Oda kodunu kopyala" aria-label="Oda kodunu kopyala">${icons.copy}</button>
+          <button class="ghost-button danger" type="button" data-leave-room>${icons.leave} Masadan Ayrıl</button>
         </div>
       </header>
 
@@ -263,20 +340,24 @@ function renderGame(data) {
             ${seatHtml(seatMap.left, "left", data)}
             ${seatHtml(seatMap.right, "right", data)}
             ${seatHtml(seatMap.bottom, "bottom", data)}
+
             <div class="center-stacks">
               <div class="stack-card">
                 <div class="wall-stack">${data.game.wallCount}</div>
                 <strong>Deste</strong>
               </div>
+
               <div class="stack-card">
                 ${data.game.discardTop ? tileHtml(data.game.discardTop, false, true, false) : '<div class="wall-stack">0</div>'}
                 <strong>Yer</strong>
               </div>
+
               <div class="stack-card">
                 ${data.game.indicator ? tileHtml(data.game.indicator, false, true, false) : '<div class="wall-stack">?</div>'}
                 <strong>Gösterge</strong>
               </div>
             </div>
+
             ${tableMessage(data)}
           </div>
         </section>
@@ -295,6 +376,7 @@ function renderGame(data) {
               <h2>Okey</h2>
               <span>${data.game.phase === "discard" ? "Taş at" : data.game.phase === "draw" ? "Taş çek" : "Hazır"}</span>
             </div>
+
             <div class="score-row">
               <div class="score-player">
                 <strong>${data.game.okey ? `${escapeHtml(colorLabel(data.game.okey.color))} ${data.game.okey.number}` : "Belirsiz"}</strong>
@@ -311,6 +393,7 @@ function renderGame(data) {
               <h2>Hareket</h2>
               <span>${data.scoreEvents.length}</span>
             </div>
+
             <ul class="event-list">
               <li>${escapeHtml(data.game.lastMove || "Masa hazır.")}</li>
               ${data.scoreEvents.map((event) => `<li>${escapeHtml(event.text)}</li>`).join("")}
@@ -326,17 +409,21 @@ function renderGame(data) {
               <strong>${turnTitle(data)}</strong>
               <span>${turnSubtitle(data, selectedTile)}</span>
             </div>
+
             <div class="sort-tools" aria-label="Taş sıralama">
               <button class="ghost-button ${sortMode === "color" ? "active" : ""}" type="button" data-sort="color">Renk</button>
               <button class="ghost-button ${sortMode === "number" ? "active" : ""}" type="button" data-sort="number">Sayı</button>
               <button class="ghost-button ${sortMode === "hand" ? "active" : ""}" type="button" data-sort="hand">El</button>
             </div>
           </div>
+
           <div class="rack" aria-label="Taşlığım">
             ${hand.length ? hand.map((tile) => tileHtml(tile, tile.id === selectedTileId, false, true)).join("") : '<div class="empty-rack">Taşlar el başlayınca görünür.</div>'}
           </div>
+
           <div class="action-bar">
             <div class="selected-readout">${selectedTile ? `${escapeHtml(tileText(selectedTile))} seçili` : "Taş seçilmedi"}</div>
+
             <div class="action-tools">
               <button class="ghost-button" type="button" data-action="drawWall" ${canDraw ? "" : "disabled"}>${icons.draw} Taş Çek</button>
               <button class="ghost-button" type="button" data-action="takeDiscard" ${canDraw && data.game.discardTop ? "" : "disabled"}>${icons.take} Yerden Al</button>
@@ -347,6 +434,7 @@ function renderGame(data) {
           </div>
         </section>
       </footer>
+
       ${noticeHtml()}
     </div>
   `;
@@ -364,6 +452,7 @@ function createSeatMap(data) {
   for (let seat = 0; seat < 4; seat += 1) {
     const offset = (seat - data.you.seat + 4) % 4;
     const label = labels[offset];
+
     if (!positions[label]) {
       positions[label] = { empty: true, seat };
     }
@@ -383,16 +472,19 @@ function seatHtml(player, position, data) {
   }
 
   const active = data.game.activePlayerId === player.id;
+
   return `
     <div class="seat ${position} ${active ? "active" : ""}">
       <div class="seat-name">
         <span>${escapeHtml(player.name)}${player.isHost ? " · Oda" : ""}</span>
         <span class="seat-score">${player.score}</span>
       </div>
+
       <div class="seat-meta">
         <span class="seat-status ${player.connected ? "online" : ""}">${player.connected ? "Online" : "Koptu"}</span>
         <span>${player.tileCount} taş</span>
       </div>
+
       <div class="backs">${tileBacks(player.tileCount)}</div>
     </div>
   `;
@@ -415,6 +507,7 @@ function tableMessage(data) {
 
   if (data.game.status === "finished") {
     const winner = data.players.find((player) => player.id === data.game.winnerId);
+
     return `
       <div class="table-message">
         <strong>${winner ? `${escapeHtml(winner.name)} bitti` : "El tamamlandı"}</strong>
@@ -437,6 +530,7 @@ function tileHtml(tile, selected, small, interactive) {
   ]
     .filter(Boolean)
     .join(" ");
+
   const label = tile.isFake ? "S" : escapeHtml(tile.label);
   const title = escapeHtml(tileText(tile));
 
@@ -478,6 +572,7 @@ function scoreWriterHtml(data) {
         <h2>Puan Yaz</h2>
         <span>Oda sahibi</span>
       </div>
+
       <form id="score-form" class="score-writer">
         <div class="writer-grid">
           <div>
@@ -486,11 +581,13 @@ function scoreWriterHtml(data) {
               ${data.players.map((player) => `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}</option>`).join("")}
             </select>
           </div>
+
           <div>
             <label for="scoreDelta">Puan</label>
             <input id="scoreDelta" name="delta" type="number" step="1" min="-500" max="500" placeholder="+10" required />
           </div>
         </div>
+
         <button class="primary-button" type="submit">${icons.plus} Puan Yaz</button>
       </form>
     </section>
@@ -523,12 +620,14 @@ function sortedHand(hand) {
     if (sortMode === "number") {
       return (a.number || 99) - (b.number || 99) || (colorRank[a.color] ?? 9) - (colorRank[b.color] ?? 9);
     }
+
     return (colorRank[a.color] ?? 9) - (colorRank[b.color] ?? 9) || (a.number || 99) - (b.number || 99);
   });
 }
 
 function keepSelectedTileIfPresent(hand) {
   if (!selectedTileId) return;
+
   if (!hand.some((tile) => tile.id === selectedTileId)) {
     selectedTileId = null;
   }
@@ -536,7 +635,9 @@ function keepSelectedTileIfPresent(hand) {
 
 function tileText(tile) {
   if (!tile) return "";
+
   if (tile.isFake) return `Sahte okey (${colorLabel(tile.color)} ${tile.number})`;
+
   return `${colorLabel(tile.color)} ${tile.number}${tile.isOkey ? " okey" : ""}`;
 }
 
@@ -547,21 +648,26 @@ function colorLabel(color) {
     blue: "Mavi",
     yellow: "Sarı"
   };
+
   return labels[color] || color;
 }
 
 function showNotice(message, level = "info") {
   notice = { message, level };
+
   clearTimeout(noticeTimer);
+
   noticeTimer = setTimeout(() => {
     notice = null;
     render();
   }, 3000);
+
   render();
 }
 
 function noticeHtml() {
   if (!notice) return "";
+
   return `<div class="toast ${notice.level === "error" ? "error" : ""}" role="status">${escapeHtml(notice.message)}</div>`;
 }
 
